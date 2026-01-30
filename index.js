@@ -165,7 +165,8 @@ app.post('/extract-best-frame', async (req, res) => {
     blur = 400,
     public_id,
     folder = 'frames',
-    openrouter_api_key
+    openrouter_api_key,
+    ai_prompt  // Optional: custom AI prompt (passed from n8n)
   } = req.body;
 
   if (!video_url) {
@@ -222,21 +223,8 @@ app.post('/extract-best-frame', async (req, res) => {
 
     console.log('All frames extracted. Asking AI to pick the best one...');
 
-    // Ask AI to pick the best frame
-    const aiResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: 'anthropic/claude-3-5-sonnet',
-        messages: [{
-          role: 'user',
-          content: [
-            {
-              type: 'text',
-              text: `You are analyzing video frames to select the best one for a reel thumbnail.
+    // Default prompt if none provided
+    const defaultPrompt = `You are analyzing video frames to select the best one for a reel thumbnail.
 
 Pick the BEST frame based on:
 1. Facial Expression: Engaged, confident, eyes open, not mid-blink or weird expression
@@ -252,7 +240,26 @@ Also determine where the person's FACE is positioned in the selected frame:
 This helps us position text overlay where it won't cover the face.
 
 RESPOND WITH ONLY THIS JSON (no other text):
-{"best_frame_index": 0, "face_position": "bottom", "reasoning": "Brief explanation"}`
+{"best_frame_index": 0, "face_position": "bottom", "reasoning": "Brief explanation"}`;
+
+    // Use custom prompt if provided, otherwise use default
+    const promptText = ai_prompt || defaultPrompt;
+
+    // Ask AI to pick the best frame
+    const aiResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'anthropic/claude-3-5-sonnet',
+        messages: [{
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: promptText
             },
             ...frameUrls.map((f, idx) => ({
               type: 'image_url',
@@ -340,11 +347,155 @@ RESPOND WITH ONLY THIS JSON (no other text):
   }
 });
 
+// Extract frames only (no AI) - returns URLs for external AI analysis
+app.post('/extract-frames-only', async (req, res) => {
+  const {
+    video_url,
+    timestamps = [0, 0.5, 1, 1.5, 2],
+    public_id,
+    folder = 'frames'
+  } = req.body;
+
+  if (!video_url) {
+    return res.status(400).json({ error: 'Missing video_url' });
+  }
+
+  const tempDir = os.tmpdir();
+  const tempFiles = [];
+  const frameUrls = [];
+
+  try {
+    console.log(`Extracting ${timestamps.length} frames from: ${video_url}`);
+
+    for (let i = 0; i < timestamps.length; i++) {
+      const ts = timestamps[i];
+      const tempFile = path.join(tempDir, `frame_${Date.now()}_${i}.jpg`);
+      tempFiles.push(tempFile);
+
+      console.log(`Extracting frame at ${ts}s...`);
+
+      await new Promise((resolve, reject) => {
+        ffmpeg(video_url)
+          .inputOptions(['-ss', String(ts), '-t', '1'])
+          .outputOptions(['-vframes', '1', '-q:v', '2'])
+          .output(tempFile)
+          .on('error', reject)
+          .on('end', resolve)
+          .run();
+      });
+
+      if (!fs.existsSync(tempFile)) {
+        throw new Error(`Frame extraction failed at ${ts}s`);
+      }
+
+      // Upload to Cloudinary WITHOUT blur (for AI analysis)
+      const uploadResult = await cloudinary.uploader.upload(tempFile, {
+        folder: folder + '/candidates',
+        public_id: `${public_id || 'frame'}_candidate_${i}`
+      });
+
+      frameUrls.push({
+        index: i,
+        timestamp: ts,
+        url: uploadResult.secure_url,
+        public_id: uploadResult.public_id
+      });
+    }
+
+    // Clean up temp files
+    tempFiles.forEach(f => {
+      if (fs.existsSync(f)) fs.unlinkSync(f);
+    });
+
+    console.log(`Extracted ${frameUrls.length} frames, returning for AI analysis`);
+
+    return res.json({
+      success: true,
+      frames: frameUrls,
+      count: frameUrls.length
+    });
+
+  } catch (error) {
+    console.error('Error:', error.message);
+    tempFiles.forEach(f => {
+      if (fs.existsSync(f)) fs.unlinkSync(f);
+    });
+    return res.status(500).json({
+      error: 'Frame extraction failed',
+      details: error.message
+    });
+  }
+});
+
+// Apply blur to a specific frame (after AI selection)
+app.post('/apply-blur', async (req, res) => {
+  const {
+    source_public_id,  // Cloudinary public_id of the unblurred frame
+    blur = 400,
+    public_id,         // New public_id for blurred version
+    folder = 'frames'
+  } = req.body;
+
+  if (!source_public_id) {
+    return res.status(400).json({ error: 'Missing source_public_id' });
+  }
+
+  try {
+    // Download the original, apply blur, re-upload
+    const cloudName = process.env.CLOUDINARY_CLOUD_NAME || 'dviqqrjfe';
+    const sourceUrl = `https://res.cloudinary.com/${cloudName}/image/upload/${source_public_id}`;
+
+    const uploadResult = await cloudinary.uploader.upload(sourceUrl, {
+      folder: folder,
+      public_id: public_id || source_public_id.split('/').pop() + '_blurred',
+      transformation: [{ effect: `blur:${blur}` }]
+    });
+
+    return res.json({
+      success: true,
+      frame_url: uploadResult.secure_url,
+      public_id: uploadResult.public_id,
+      blur: blur
+    });
+
+  } catch (error) {
+    console.error('Error:', error.message);
+    return res.status(500).json({
+      error: 'Blur application failed',
+      details: error.message
+    });
+  }
+});
+
+// Cleanup candidate frames after selection
+app.post('/cleanup-candidates', async (req, res) => {
+  const { public_ids } = req.body;
+
+  if (!public_ids || !Array.isArray(public_ids)) {
+    return res.status(400).json({ error: 'Missing public_ids array' });
+  }
+
+  const results = [];
+  for (const pid of public_ids) {
+    try {
+      await cloudinary.uploader.destroy(pid);
+      results.push({ public_id: pid, deleted: true });
+    } catch (e) {
+      results.push({ public_id: pid, deleted: false, error: e.message });
+    }
+  }
+
+  return res.json({ success: true, results });
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Video Frame Extractor running on port ${PORT}`);
   console.log('Endpoints:');
   console.log('  POST /extract-frame - Extract single frame from any video URL');
   console.log('  POST /extract-best-frame - Extract 5 frames, AI picks the best one');
+  console.log('  POST /extract-frames-only - Extract frames without AI (for external analysis)');
+  console.log('  POST /apply-blur - Apply blur to a selected frame');
+  console.log('  POST /cleanup-candidates - Delete candidate frames after selection');
   console.log('  POST /get-frame-url - Get frame URL for Cloudinary videos');
 });
