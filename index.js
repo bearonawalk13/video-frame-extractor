@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const ffmpeg = require('fluent-ffmpeg');
 const cloudinary = require('cloudinary').v2;
+const fetch = require('node-fetch');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -156,10 +157,173 @@ app.post('/get-frame-url', (req, res) => {
   });
 });
 
+// NEW: Extract multiple frames and use AI to pick the best one
+app.post('/extract-best-frame', async (req, res) => {
+  const {
+    video_url,
+    timestamps = [0, 0.5, 1, 1.5, 2],  // Extract 5 frames from first 2 seconds
+    blur = 400,
+    public_id,
+    folder = 'frames',
+    openrouter_api_key
+  } = req.body;
+
+  if (!video_url) {
+    return res.status(400).json({ error: 'Missing video_url' });
+  }
+
+  const apiKey = openrouter_api_key || process.env.OPENROUTER_API_KEY;
+  if (!apiKey) {
+    return res.status(400).json({ error: 'Missing OpenRouter API key' });
+  }
+
+  const tempDir = os.tmpdir();
+  const tempFiles = [];
+  const frameUrls = [];
+
+  try {
+    console.log(`Extracting ${timestamps.length} frames from: ${video_url}`);
+
+    // Extract frames at each timestamp
+    for (let i = 0; i < timestamps.length; i++) {
+      const ts = timestamps[i];
+      const tempFile = path.join(tempDir, `frame_${Date.now()}_${i}.jpg`);
+      tempFiles.push(tempFile);
+
+      console.log(`Extracting frame at ${ts}s...`);
+
+      await new Promise((resolve, reject) => {
+        ffmpeg(video_url)
+          .inputOptions(['-ss', String(ts), '-t', '1'])
+          .outputOptions(['-vframes', '1', '-q:v', '2'])
+          .output(tempFile)
+          .on('error', reject)
+          .on('end', resolve)
+          .run();
+      });
+
+      if (!fs.existsSync(tempFile)) {
+        throw new Error(`Frame extraction failed at ${ts}s`);
+      }
+
+      // Upload to Cloudinary WITHOUT blur (for AI analysis)
+      const uploadResult = await cloudinary.uploader.upload(tempFile, {
+        folder: folder + '/candidates',
+        public_id: `${public_id || 'frame'}_candidate_${i}`
+      });
+
+      frameUrls.push({
+        index: i,
+        timestamp: ts,
+        url: uploadResult.secure_url,
+        public_id: uploadResult.public_id
+      });
+    }
+
+    console.log('All frames extracted. Asking AI to pick the best one...');
+
+    // Ask AI to pick the best frame
+    const aiResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'anthropic/claude-3-5-sonnet',
+        messages: [{
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: `You are analyzing video frames to select the best one for a reel thumbnail.
+
+Pick the BEST frame based on:
+1. Facial Expression: Engaged, confident, eyes open, not mid-blink or weird expression
+2. Composition: Good framing, person well-positioned
+3. Clarity: Not blurry, good lighting
+4. No Captions: Prefer frames without burned-in text/captions
+
+RESPOND WITH ONLY THIS JSON (no other text):
+{"best_frame_index": 0, "reasoning": "Brief explanation"}`
+            },
+            ...frameUrls.map((f, idx) => ({
+              type: 'image_url',
+              image_url: { url: f.url }
+            }))
+          ]
+        }],
+        max_tokens: 200
+      })
+    });
+
+    const aiResult = await aiResponse.json();
+    const aiText = aiResult.choices?.[0]?.message?.content || '{"best_frame_index": 0, "reasoning": "Default to first frame"}';
+
+    // Parse AI response
+    let bestIndex = 0;
+    let reasoning = 'Default selection';
+    try {
+      const parsed = JSON.parse(aiText);
+      bestIndex = parsed.best_frame_index || 0;
+      reasoning = parsed.reasoning || 'AI selected';
+    } catch (e) {
+      console.log('Could not parse AI response, using first frame');
+    }
+
+    const bestFrame = frameUrls[bestIndex] || frameUrls[0];
+    console.log(`AI selected frame ${bestIndex}: ${reasoning}`);
+
+    // Now upload the best frame WITH blur
+    const bestTempFile = tempFiles[bestIndex] || tempFiles[0];
+    const finalUpload = await cloudinary.uploader.upload(bestTempFile, {
+      folder: folder,
+      public_id: public_id,
+      transformation: [{ effect: `blur:${blur}` }]
+    });
+
+    // Clean up temp files
+    tempFiles.forEach(f => {
+      if (fs.existsSync(f)) fs.unlinkSync(f);
+    });
+
+    // Delete candidate frames from Cloudinary (optional cleanup)
+    for (const frame of frameUrls) {
+      try {
+        await cloudinary.uploader.destroy(frame.public_id);
+      } catch (e) { /* ignore cleanup errors */ }
+    }
+
+    return res.json({
+      success: true,
+      frame_url: finalUpload.secure_url,
+      public_id: finalUpload.public_id,
+      width: finalUpload.width,
+      height: finalUpload.height,
+      selected_index: bestIndex,
+      selected_timestamp: bestFrame.timestamp,
+      reasoning: reasoning,
+      blur: blur,
+      candidates_analyzed: frameUrls.length
+    });
+
+  } catch (error) {
+    console.error('Error:', error.message);
+    tempFiles.forEach(f => {
+      if (fs.existsSync(f)) fs.unlinkSync(f);
+    });
+    return res.status(500).json({
+      error: 'Best frame extraction failed',
+      details: error.message
+    });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Video Frame Extractor running on port ${PORT}`);
   console.log('Endpoints:');
-  console.log('  POST /extract-frame - Extract frame from any video URL');
+  console.log('  POST /extract-frame - Extract single frame from any video URL');
+  console.log('  POST /extract-best-frame - Extract 5 frames, AI picks the best one');
   console.log('  POST /get-frame-url - Get frame URL for Cloudinary videos');
 });
