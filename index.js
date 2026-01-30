@@ -272,28 +272,39 @@ RESPOND WITH ONLY THIS JSON (no other text):
     });
 
     const aiResult = await aiResponse.json();
-    const aiText = aiResult.choices?.[0]?.message?.content || '{"best_frame_index": 0, "face_position": "middle", "reasoning": "Default to first frame"}';
+    const aiText = aiResult.choices?.[0]?.message?.content || '{"best_frame_index": 0, "text_position": "top", "reasoning": "Default to first frame"}';
 
-    // Parse AI response
+    // Parse AI response - supports both text_position (new) and face_position (legacy)
     let bestIndex = 0;
-    let facePosition = 'middle';  // Default to middle if not detected
+    let textPosition = 'top';  // Default to top (safer than middle)
     let reasoning = 'Default selection';
     try {
       const parsed = JSON.parse(aiText);
       bestIndex = parsed.best_frame_index || 0;
-      facePosition = parsed.face_position || 'middle';
+
+      // New format: AI returns text_position directly
+      if (parsed.text_position) {
+        textPosition = parsed.text_position;
+      }
+      // Legacy format: AI returns face_position, we calculate inverse
+      else if (parsed.face_position) {
+        const facePosition = parsed.face_position;
+        textPosition = facePosition === 'bottom' ? 'top' :
+                       facePosition === 'top' ? 'bottom' : 'top';
+      }
+
       reasoning = parsed.reasoning || 'AI selected';
     } catch (e) {
-      console.log('Could not parse AI response, using first frame');
+      console.log('Could not parse AI response, using first frame with text at top');
     }
 
-    // Validate face_position
-    if (!['top', 'middle', 'bottom'].includes(facePosition)) {
-      facePosition = 'middle';
+    // Validate text_position - only allow top or bottom (never middle)
+    if (!['top', 'bottom'].includes(textPosition)) {
+      textPosition = 'top';
     }
 
     const bestFrame = frameUrls[bestIndex] || frameUrls[0];
-    console.log(`AI selected frame ${bestIndex} (face: ${facePosition}): ${reasoning}`);
+    console.log(`AI selected frame ${bestIndex} (text: ${textPosition}): ${reasoning}`);
 
     // Now upload the best frame WITH blur
     const bestTempFile = tempFiles[bestIndex] || tempFiles[0];
@@ -315,11 +326,6 @@ RESPOND WITH ONLY THIS JSON (no other text):
       } catch (e) { /* ignore cleanup errors */ }
     }
 
-    // Calculate text_position (inverse of face_position)
-    // If face is at bottom, put text at top, and vice versa
-    const textPosition = facePosition === 'bottom' ? 'top' :
-                         facePosition === 'top' ? 'bottom' : 'middle';
-
     return res.json({
       success: true,
       frame_url: finalUpload.secure_url,
@@ -329,8 +335,7 @@ RESPOND WITH ONLY THIS JSON (no other text):
       selected_index: bestIndex,
       selected_timestamp: bestFrame.timestamp,
       reasoning: reasoning,
-      face_position: facePosition,
-      text_position: textPosition,  // Where to place text overlay
+      text_position: textPosition,  // Where to place text overlay (top or bottom only)
       blur: blur,
       candidates_analyzed: frameUrls.length
     });
