@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: video-frame-extractor
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: CLOUDINARY_CLOUD_NAME
+        value: dviqqrjfe
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
