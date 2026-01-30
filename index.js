@@ -1,14 +1,13 @@
 const express = require('express');
 const cors = require('cors');
 const ffmpeg = require('fluent-ffmpeg');
-const ffmpegPath = require('ffmpeg-static');
 const cloudinary = require('cloudinary').v2;
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-// Configure ffmpeg path
-ffmpeg.setFfmpegPath(ffmpegPath);
+// Use system ffmpeg (installed via Dockerfile or nixpacks)
+// No need to set path - fluent-ffmpeg will find it in PATH
 
 // Configure Cloudinary
 cloudinary.config({
